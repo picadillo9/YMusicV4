@@ -1,0 +1,110 @@
+name: ios
+
+# Unsigned iOS build: produces YMusic-unsigned.ipa as an artifact, to be signed and sideloaded on the
+# device (e.g. Sideloadly with a personal Apple ID). Run by hand or by pushing to ios-build.
+on:
+  workflow_dispatch:
+  push:
+    branches: [ios-build]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FFMPEG_BUILD_REPO: ymusic-io/ffmpeg-build
+  FFMPEG_BUILD_REF: 5b3bb3beafd31b51b8a2067a4b79c8e4f00afc4b
+
+jobs:
+  ios:
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: YMusicV4
+
+      # Compose 1.11.1 links an iOS 26 UIKit class; Xcode 26 links it cleanly. Without one, the build
+      # phase's -PiosAllowUndefined=true still lets an older Xcode link.
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+          ls -d /Applications/Xcode*.app
+          xc="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -n 1 || true)"
+          if [ -n "$xc" ]; then sudo xcode-select -s "$xc"; fi
+          xcodebuild -version
+
+      - id: cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ffmpeg-build/out/ios-arm64
+          key: ffmpeg-ios-arm64-${{ env.FFMPEG_BUILD_REF }}
+
+      - if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ env.FFMPEG_BUILD_REPO }}
+          ref: ${{ env.FFMPEG_BUILD_REF }}
+          path: ffmpeg-build
+          submodules: recursive
+          fetch-depth: 1
+
+      - if: steps.cache.outputs.cache-hit != 'true'
+        name: Build ffmpeg ios-arm64
+        working-directory: ffmpeg-build
+        run: |
+          brew install nasm automake autoconf libtool pkg-config meson ninja
+          scripts/build-ios.sh iphoneos
+
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - uses: gradle/actions/setup-gradle@0b6dd653ba04f4f93bf581ec31e66cbd7dcb644d # v4
+
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.konan
+          key: konan-${{ runner.os }}-${{ hashFiles('YMusicV4/gradle/libs.versions.toml', 'YMusicV4/buildSrc/**/*.kt') }}
+          restore-keys: konan-${{ runner.os }}-
+
+      # The Xcode build phase runs the Gradle framework build (embedAndSignAppleFrameworkForXcode).
+      - name: Build iosApp (unsigned)
+        working-directory: YMusicV4/iosApp
+        run: |
+          xcodebuild -project iosApp.xcodeproj -target iosApp -configuration Release \
+            -sdk iphoneos -arch arm64 \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package IPA
+        working-directory: YMusicV4/iosApp
+        run: |
+          set -euo pipefail
+          app="$(ls -d build/Release-iphoneos/*.app | head -n 1)"
+          [ -d "$app" ] || { echo "no .app produced" >&2; exit 1; }
+          mkdir -p "$RUNNER_TEMP/ipa/Payload"
+          cp -R "$app" "$RUNNER_TEMP/ipa/Payload/"
+          (cd "$RUNNER_TEMP/ipa" && zip -qry YMusic-unsigned.ipa Payload)
+          ls -l "$RUNNER_TEMP/ipa"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: YMusic-unsigned-ipa
+          path: ${{ runner.temp }}/ipa/YMusic-unsigned.ipa
+          if-no-files-found: error
+
+      - if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ios-build-logs
+          path: |
+            YMusicV4/**/build/reports/
+            ~/Library/Logs/DiagnosticReports/
+          if-no-files-found: ignore
